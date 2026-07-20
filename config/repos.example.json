@@ -1,0 +1,10 @@
+{
+  "default_repository": "example-app",
+  "repositories": {
+    "example-app": {
+      "path": "~/projects/example-app",
+      "remote": "origin",
+      "default_branch": "main"
+    }
+  }
+}

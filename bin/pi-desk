@@ -1,0 +1,757 @@
+#!/usr/bin/env python3
+"""Save and restore semantic Herdr/Pi desks without moving durable worktrees."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+SCHEMA_VERSION = 1
+IDLE_STATUSES = {"idle", "done"}
+USABLE_STATUSES = {"idle", "working", "done"}
+TERMINAL_BAD_STATUSES = {"blocked", "error", "failed"}
+XDG_STATE = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser()
+DEFAULT_STATE_DIR = XDG_STATE / "minimalist-pi-orchestrator"
+DESK_STATE_DIR = Path(os.environ.get("PI_DESK_STATE_DIR", str(DEFAULT_STATE_DIR))).expanduser()
+DESKS_DIR = DESK_STATE_DIR / "desks"
+DESK_LOCK = DESK_STATE_DIR / "desk.lock"
+WORKER_STATE_DIR = Path(os.environ.get("PI_WORKER_STATE_DIR", str(DEFAULT_STATE_DIR))).expanduser()
+WORKERS_DIR = WORKER_STATE_DIR / "workers"
+
+
+class DeskError(RuntimeError):
+    """A fail-closed desk lifecycle error."""
+
+
+def run(argv: list[str], *, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(argv, cwd=cwd, text=True, capture_output=True)
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise DeskError(f"{' '.join(argv[:3])}: {detail}")
+    return result
+
+
+def git(path: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return run(["git", "-C", str(path), *args], check=check)
+
+
+def recursive_value(value: Any, key: str) -> str | None:
+    if isinstance(value, dict):
+        found = value.get(key)
+        if isinstance(found, str):
+            return found
+        if isinstance(found, (int, float)):
+            return str(found)
+        for child in value.values():
+            if result := recursive_value(child, key):
+                return result
+    elif isinstance(value, list):
+        for child in value:
+            if result := recursive_value(child, key):
+                return result
+    return None
+
+
+def slugify(value: str) -> str:
+    value = re.sub(r"[^a-z0-9._-]+", "-", value.strip().lower())
+    return value.strip("-._")
+
+
+def manifest_path(name: str) -> Path:
+    slug = slugify(name)
+    if not slug:
+        raise DeskError("desk name must contain a letter or number")
+    return DESKS_DIR / f"{slug}.json"
+
+
+def locked():
+    DESK_STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    handle = DESK_LOCK.open("a+")
+    os.chmod(DESK_LOCK, 0o600)
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    return handle
+
+
+def worker_locked():
+    WORKER_STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(WORKER_STATE_DIR, 0o700)
+    path = WORKER_STATE_DIR / "state.lock"
+    handle = path.open("a+")
+    os.chmod(path, 0o600)
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    return handle
+
+
+def atomic_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def preserve_previous(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        current = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DeskError(f"refusing to replace invalid current manifest {path}: {exc}") from exc
+    if not isinstance(current, dict) or current.get("schema_version") != SCHEMA_VERSION:
+        raise DeskError(f"refusing to replace unsupported current manifest {path}")
+    previous = path.with_name(f"{path.stem}.previous{path.suffix}")
+    fd, temporary = tempfile.mkstemp(prefix=f".{previous.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with path.open("rb") as source, os.fdopen(fd, "wb") as target:
+            shutil.copyfileobj(source, target)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, previous)
+        os.chmod(previous, 0o600)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def snapshot() -> dict[str, Any]:
+    result = run(["herdr", "api", "snapshot"])
+    try:
+        value = json.loads(result.stdout)
+        snap = value.get("result", {}).get("snapshot", value.get("snapshot", value))
+    except json.JSONDecodeError as exc:
+        raise DeskError(f"could not parse Herdr snapshot: {exc}") from exc
+    if not isinstance(snap, dict):
+        raise DeskError("Herdr snapshot has no snapshot object")
+    for key in ("workspaces", "tabs", "agents"):
+        if not isinstance(snap.get(key), list):
+            raise DeskError(f"Herdr snapshot is missing '{key}'")
+    return snap
+
+
+def worker_records() -> list[tuple[Path, dict[str, Any]]]:
+    records: list[tuple[Path, dict[str, Any]]] = []
+    if not WORKERS_DIR.exists():
+        return records
+    for path in sorted(WORKERS_DIR.glob("*.json")):
+        try:
+            value = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise DeskError(f"invalid worker registry record {path}: {exc}") from exc
+        if not isinstance(value, dict):
+            raise DeskError(f"invalid worker registry record {path}")
+        records.append((path, value))
+    return records
+
+
+def treehouse_leases(repo_root: Path) -> dict[Path, str]:
+    if not repo_root.is_dir():
+        raise DeskError(f"worker repository root is missing: {repo_root}")
+    result = run(["treehouse", "status"], cwd=repo_root)
+    leases: dict[Path, str] = {}
+    pattern = re.compile(r"^\S+\s+leased\s+(.+?)\s+\(held by (.+)\)\s*$")
+    for line in result.stdout.splitlines():
+        match = pattern.match(line)
+        if match:
+            leases[Path(match.group(1)).expanduser().resolve()] = match.group(2).strip()
+    return leases
+
+
+def cached_treehouse_leases(
+    cache: dict[Path, dict[Path, str]], repo_root: Path
+) -> dict[Path, str]:
+    if repo_root not in cache:
+        cache[repo_root] = treehouse_leases(repo_root)
+    return cache[repo_root]
+
+
+def linked_worktree_identity(path: Path) -> tuple[str, str]:
+    if not path.is_dir():
+        raise DeskError(f"worktree is missing: {path}")
+    top_result = git(path, "rev-parse", "--show-toplevel", check=False)
+    if top_result.returncode != 0:
+        raise DeskError(f"worktree is not a Git repository: {path}")
+    top = Path(top_result.stdout.strip()).resolve()
+    git_dir = Path(git(path, "rev-parse", "--absolute-git-dir").stdout.strip()).resolve()
+    common = Path(git(path, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()).resolve()
+    if top != path.resolve():
+        raise DeskError(f"worktree moved or is not a repository root: {path}")
+    if git_dir == common:
+        raise DeskError(f"recorded worker is now a primary checkout: {path}")
+    branch_result = git(path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    if branch_result.returncode != 0:
+        raise DeskError(f"worktree is detached: {path}")
+    head = git(path, "rev-parse", "--verify", "HEAD").stdout.strip()
+    return branch_result.stdout.strip(), head
+
+
+def session_for_agent(agent: dict[str, Any], tab_id: str) -> str:
+    session = agent.get("agent_session")
+    if not isinstance(session, dict):
+        raise DeskError(f"Pi tab {tab_id} has no session identity")
+    if session.get("agent") != "pi" or session.get("source") != "herdr:pi":
+        raise DeskError(f"Pi tab {tab_id} has an ambiguous session identity")
+    if session.get("kind") != "path" or not isinstance(session.get("value"), str):
+        raise DeskError(f"Pi tab {tab_id} does not report a restorable session path")
+    value = session["value"]
+    if not Path(value).is_file():
+        raise DeskError(f"Pi session file is missing for tab {tab_id}: {value}")
+    return value
+
+
+def _save_desk(args: argparse.Namespace) -> dict[str, Any]:
+    snap = snapshot()
+    workspace_id = os.environ.get("HERDR_WORKSPACE_ID") or recursive_value(snap, "focused_workspace_id")
+    orchestrator_tab = os.environ.get("HERDR_TAB_ID") or recursive_value(snap, "focused_tab_id")
+    if not workspace_id or not orchestrator_tab:
+        raise DeskError("save must run from a focused Herdr orchestrator tab")
+    workspaces = [item for item in snap["workspaces"] if item.get("workspace_id") == workspace_id]
+    if len(workspaces) != 1:
+        raise DeskError(f"could not identify Herdr workspace {workspace_id}")
+    tabs = sorted(
+        (item for item in snap["tabs"] if item.get("workspace_id") == workspace_id),
+        key=lambda item: item.get("number", 0),
+    )
+    tabs_by_id = {item.get("tab_id"): item for item in tabs}
+    agents_by_tab: dict[str, list[dict[str, Any]]] = {}
+    for agent in snap["agents"]:
+        if agent.get("workspace_id") == workspace_id and agent.get("agent") == "pi":
+            agents_by_tab.setdefault(str(agent.get("tab_id")), []).append(agent)
+
+    registries = worker_records()
+    managed_by_tab: dict[str, tuple[Path, dict[str, Any]]] = {}
+    for registry, state in registries:
+        if state.get("workspace_id") != workspace_id:
+            continue
+        tab_id = str(state.get("tab_id", ""))
+        if not tab_id or tab_id in managed_by_tab:
+            raise DeskError(f"ambiguous worker registry tab identity in {registry}")
+        managed_by_tab[tab_id] = (registry, state)
+        if tab_id not in tabs_by_id:
+            raise DeskError(f"managed worker '{state.get('name', registry.stem)}' has no visible recorded tab")
+
+    include = set(args.include_tab)
+    unknown = include - set(tabs_by_id)
+    if unknown:
+        raise DeskError(f"explicitly included tabs do not exist in this workspace: {', '.join(sorted(unknown))}")
+    included_ids = {orchestrator_tab, *managed_by_tab, *include}
+    lease_cache: dict[Path, dict[Path, str]] = {}
+    entries: list[dict[str, Any]] = []
+    confirmations: list[tuple[str, str]] = []
+    sessions: set[str] = set()
+    excluded: list[str] = []
+
+    for tab in tabs:
+        tab_id = str(tab.get("tab_id"))
+        agents = agents_by_tab.get(tab_id, [])
+        if tab_id not in included_ids:
+            if agents:
+                excluded.append(str(tab.get("label") or tab_id))
+            continue
+        if tab.get("pane_count") != 1 or len(agents) != 1:
+            raise DeskError(f"included tab {tab_id} is ambiguous; expected exactly one Pi root pane")
+        agent = agents[0]
+        status_value = str(agent.get("agent_status") or tab.get("agent_status") or "unknown")
+        if status_value not in IDLE_STATUSES:
+            raise DeskError(f"Pi tab {tab_id} is not idle (status: {status_value}); wait for it to settle")
+        session = session_for_agent(agent, tab_id)
+        if session in sessions:
+            raise DeskError(f"Pi session identity is duplicated in Herdr: {session}")
+        sessions.add(session)
+        cwd_value = agent.get("cwd")
+        if not isinstance(cwd_value, str) or not Path(cwd_value).is_dir():
+            raise DeskError(f"Pi tab {tab_id} has a missing or invalid cwd: {cwd_value}")
+
+        entry: dict[str, Any] = {
+            "role": "orchestrator" if tab_id == orchestrator_tab else "unmanaged",
+            "label": str(tab.get("label") or "Pi"),
+            "cwd": str(Path(cwd_value).resolve()),
+            "session": session,
+            "focused": bool(tab.get("focused") or agent.get("focused")),
+        }
+        if tab_id in managed_by_tab:
+            if tab_id == orchestrator_tab:
+                raise DeskError("the orchestrator tab is also recorded as a managed worker")
+            registry, state = managed_by_tab[tab_id]
+            if state.get("pane_id") != agent.get("pane_id"):
+                raise DeskError(f"worker '{state.get('name')}' registry pane does not match its Pi tab")
+            worktree = Path(str(state.get("worktree", ""))).expanduser().resolve()
+            if Path(cwd_value).resolve() != worktree:
+                raise DeskError(
+                    f"worker '{state.get('name')}' Pi cwd mismatch: expected {worktree}, found {cwd_value}"
+                )
+            branch, head = linked_worktree_identity(worktree)
+            expected_branch = state.get("branch")
+            if branch != expected_branch:
+                raise DeskError(f"worker '{state.get('name')}' branch mismatch: expected {expected_branch}, found {branch}")
+            holder = state.get("name")
+            repository = state.get("repository")
+            repo_root_value = state.get("repo_root")
+            if not isinstance(holder, str) or not holder:
+                raise DeskError(f"worker registry {registry} has no lease-holder name")
+            if not isinstance(repository, str) or not repository:
+                raise DeskError(f"worker '{holder}' has no repository identity")
+            if not isinstance(repo_root_value, str) or not repo_root_value:
+                raise DeskError(f"worker '{holder}' has no repository root")
+            repo_root = Path(repo_root_value).expanduser().resolve()
+            leases = cached_treehouse_leases(lease_cache, repo_root)
+            actual_holder = leases.get(worktree)
+            if actual_holder != holder:
+                raise DeskError(
+                    f"worker '{holder}' lease mismatch at {worktree}: expected {holder}, found {actual_holder or 'no lease'}"
+                )
+            entry["role"] = "managed_worker"
+            entry["managed"] = {
+                "name": holder,
+                "repository": repository,
+                "worktree": str(worktree),
+                "branch": branch,
+                "head": head,
+                "lease_holder": holder,
+                "registry_file": registry.name,
+            }
+        entries.append(entry)
+        confirmations.append((tab_id, session))
+
+    if not any(entry["role"] == "orchestrator" for entry in entries):
+        raise DeskError("the current orchestrator tab is not a restorable Pi tab")
+    if sum(bool(entry["focused"]) for entry in entries) > 1:
+        raise DeskError("Herdr reports multiple focused tabs in the saved desk")
+    # Re-read immediately before writing so a Pi that began work or changed
+    # session during validation cannot be captured from a stale idle snapshot.
+    confirmed_snapshot = snapshot()
+    confirmed_agents: dict[str, list[dict[str, Any]]] = {}
+    for agent in confirmed_snapshot["agents"]:
+        if agent.get("workspace_id") == workspace_id and agent.get("agent") == "pi":
+            confirmed_agents.setdefault(str(agent.get("tab_id")), []).append(agent)
+    for tab_id, expected_session in confirmations:
+        agents = confirmed_agents.get(tab_id, [])
+        if len(agents) != 1:
+            raise DeskError(f"Pi tab {tab_id} changed while the desk was being saved; retry when stable")
+        agent = agents[0]
+        status_value = str(agent.get("agent_status") or "unknown")
+        if status_value not in IDLE_STATUSES:
+            raise DeskError(f"Pi tab {tab_id} began working while the desk was being saved; retry when idle")
+        if session_for_agent(agent, tab_id) != expected_session:
+            raise DeskError(f"Pi tab {tab_id} changed session while the desk was being saved; retry when stable")
+
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "saved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "workspace": {"label": str(workspaces[0].get("label") or args.name)},
+        "tabs": entries,
+    }
+    path = manifest_path(args.name)
+    preserve_previous(path)
+    atomic_json(path, manifest)
+    result: dict[str, Any] = {
+        "name": slugify(args.name),
+        "manifest": str(path),
+        "tabs": len(entries),
+        "message": "Desk saved without closing tabs or returning leases. Exit each Pi normally before shutdown so sessions flush.",
+    }
+    if excluded:
+        result["warning"] = f"Excluded unmanaged Pi tabs: {', '.join(excluded)}. Use --include-tab deliberately to include one."
+    return result
+
+
+def load_manifest(name: str) -> tuple[Path, dict[str, Any]]:
+    path = manifest_path(name)
+    try:
+        value = json.loads(path.read_text())
+    except FileNotFoundError as exc:
+        raise DeskError(f"desk manifest not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise DeskError(f"invalid desk manifest {path}: {exc}") from exc
+    if not isinstance(value, dict) or value.get("schema_version") != SCHEMA_VERSION:
+        raise DeskError(f"unsupported desk manifest schema in {path}")
+    workspace = value.get("workspace")
+    tabs = value.get("tabs")
+    if not isinstance(workspace, dict) or not isinstance(workspace.get("label"), str):
+        raise DeskError("desk manifest has an invalid workspace")
+    if not isinstance(tabs, list) or not tabs:
+        raise DeskError("desk manifest has no tabs")
+    sessions: set[str] = set()
+    roles = 0
+    for index, entry in enumerate(tabs):
+        if not isinstance(entry, dict):
+            raise DeskError(f"desk manifest tab {index} is invalid")
+        for key in ("role", "label", "cwd", "session"):
+            if not isinstance(entry.get(key), str) or not entry[key]:
+                raise DeskError(f"desk manifest tab {index} has invalid {key}")
+        if entry["role"] not in {"orchestrator", "managed_worker", "unmanaged"}:
+            raise DeskError(f"desk manifest tab {index} has unknown role {entry['role']}")
+        roles += entry["role"] == "orchestrator"
+        if entry["session"] in sessions:
+            raise DeskError(f"desk manifest duplicates session {entry['session']}")
+        sessions.add(entry["session"])
+        if not Path(entry["session"]).is_file():
+            raise DeskError(f"Pi session file is missing: {entry['session']}")
+        if not Path(entry["cwd"]).is_dir():
+            raise DeskError(f"recorded cwd is missing: {entry['cwd']}")
+        if entry["role"] == "managed_worker" and not isinstance(entry.get("managed"), dict):
+            raise DeskError(f"managed tab {index} has no managed identity")
+    if roles != 1:
+        raise DeskError("desk manifest must contain exactly one orchestrator")
+    return path, value
+
+
+def validate_managed(
+    entry: dict[str, Any], lease_cache: dict[Path, dict[Path, str]]
+) -> tuple[Path, dict[str, Any]]:
+    managed = entry["managed"]
+    required = ("name", "repository", "worktree", "branch", "head", "lease_holder", "registry_file")
+    if any(not isinstance(managed.get(key), str) or not managed[key] for key in required):
+        raise DeskError(f"managed identity is incomplete for {entry['label']}")
+    if Path(managed["registry_file"]).name != managed["registry_file"]:
+        raise DeskError(f"invalid worker registry identity for {entry['label']}")
+    registry = WORKERS_DIR / managed["registry_file"]
+    try:
+        state = json.loads(registry.read_text())
+    except FileNotFoundError as exc:
+        raise DeskError(f"worker registry record is missing: {registry}") from exc
+    except json.JSONDecodeError as exc:
+        raise DeskError(f"worker registry record is invalid: {registry}") from exc
+    for registry_key, manifest_key in (
+        ("name", "name"), ("repository", "repository"), ("worktree", "worktree"), ("branch", "branch")
+    ):
+        actual = state.get(registry_key)
+        expected = managed[manifest_key]
+        if registry_key == "worktree":
+            actual = str(Path(str(actual)).expanduser().resolve())
+        if actual != expected:
+            raise DeskError(
+                f"worker '{managed['name']}' registry {registry_key} mismatch: expected {expected}, found {actual}"
+            )
+    worktree = Path(managed["worktree"]).resolve()
+    branch, head = linked_worktree_identity(worktree)
+    if branch != managed["branch"]:
+        raise DeskError(f"worker '{managed['name']}' branch mismatch: expected {managed['branch']}, found {branch}")
+    if head != managed["head"]:
+        raise DeskError(f"worker '{managed['name']}' HEAD mismatch: expected {managed['head']}, found {head}")
+    conflicts = git(worktree, "diff", "--name-only", "--diff-filter=U", check=False).stdout.strip()
+    if conflicts:
+        raise DeskError(f"worker '{managed['name']}' has unresolved conflicts; preserved without restore: {conflicts}")
+    repo_root_value = state.get("repo_root")
+    if not isinstance(repo_root_value, str) or not repo_root_value:
+        raise DeskError(f"worker '{managed['name']}' registry has no repository root")
+    repo_root = Path(repo_root_value).expanduser().resolve()
+    leases = cached_treehouse_leases(lease_cache, repo_root)
+    actual_holder = leases.get(worktree)
+    if actual_holder != managed["lease_holder"]:
+        raise DeskError(
+            f"worker '{managed['name']}' lease mismatch: expected {managed['lease_holder']}, "
+            f"found {actual_holder or 'no lease'}"
+        )
+    return registry, state
+
+
+def tab_runtime(response: str, context: str) -> dict[str, str | None]:
+    try:
+        value = json.loads(response)
+    except json.JSONDecodeError as exc:
+        raise DeskError(f"could not parse Herdr {context} response: {response.strip()}") from exc
+    runtime = {
+        "workspace_id": recursive_value(value, "workspace_id"),
+        "tab_id": recursive_value(value, "tab_id"),
+        "pane_id": recursive_value(value, "pane_id"),
+        "terminal_id": recursive_value(value, "terminal_id"),
+    }
+    if not runtime["workspace_id"] or not runtime["tab_id"] or not runtime["pane_id"]:
+        raise DeskError(f"Herdr {context} did not return workspace, tab, and pane IDs")
+    return runtime
+
+
+def env_args(entry: dict[str, Any]) -> list[str]:
+    if entry["role"] != "managed_worker":
+        return []
+    managed = entry["managed"]
+    return [
+        "--env", f"TREEHOUSE_LEASE_HOLDER={managed['lease_holder']}",
+        "--env", f"PI_WORKER_NAME={managed['name']}",
+        "--env", f"PI_WORKER_REPOSITORY={managed['repository']}",
+    ]
+
+
+def update_registry(registry: Path, state: dict[str, Any], runtime: dict[str, str | None]) -> None:
+    updated = dict(state)
+    for key in ("workspace_id", "tab_id", "pane_id", "terminal_id"):
+        updated[key] = runtime[key]
+    atomic_json(registry, updated)
+
+
+def startup_timing() -> tuple[float, float]:
+    try:
+        timeout = float(os.environ.get("PI_DESK_STARTUP_TIMEOUT_SECONDS", "15"))
+        interval = float(os.environ.get("PI_DESK_STARTUP_POLL_SECONDS", "0.25"))
+    except ValueError as exc:
+        raise DeskError("Pi desk startup timeout and poll interval must be numbers") from exc
+    if timeout <= 0 or interval <= 0:
+        raise DeskError("Pi desk startup timeout and poll interval must be positive")
+    return timeout, interval
+
+
+def wait_for_restored_pi(entry: dict[str, Any], runtime: dict[str, str | None]) -> None:
+    timeout, interval = startup_timing()
+    deadline = time.monotonic() + timeout
+    expected_pane = str(runtime["pane_id"])
+    expected_tab = str(runtime["tab_id"])
+    expected_workspace = str(runtime["workspace_id"])
+    last_state = "Pi did not appear"
+
+    while True:
+        snap = snapshot()
+        pane_agents = [agent for agent in snap["agents"] if str(agent.get("pane_id")) == expected_pane]
+        if len(pane_agents) > 1:
+            raise DeskError(f"restored pane {expected_pane} reports multiple agents")
+        if pane_agents:
+            agent = pane_agents[0]
+            if agent.get("agent") != "pi":
+                raise DeskError(f"restored pane {expected_pane} reports agent {agent.get('agent')}, expected pi")
+            session = agent.get("agent_session")
+            if not isinstance(session, dict):
+                last_state = "Pi appeared but session identity has not appeared"
+            else:
+                identity_fields = ("agent", "source", "kind", "value")
+                missing_identity = [field for field in identity_fields if not session.get(field)]
+                if missing_identity:
+                    last_state = "Pi session identity remained incomplete (missing " + ", ".join(missing_identity) + ")"
+                else:
+                    actual_session = session["value"]
+                    if (
+                        session["agent"] != "pi"
+                        or session["source"] != "herdr:pi"
+                        or session["kind"] != "path"
+                        or actual_session != entry["session"]
+                    ):
+                        raise DeskError(
+                            f"restored Pi pane {expected_pane} session mismatch: "
+                            f"expected {entry['session']}, found {actual_session}"
+                        )
+                    actual_cwd = agent.get("cwd")
+                    if not isinstance(actual_cwd, str) or not actual_cwd:
+                        last_state = "Pi session appeared but cwd has not appeared"
+                    elif Path(actual_cwd).resolve() != Path(entry["cwd"]).resolve():
+                        raise DeskError(
+                            f"restored Pi pane {expected_pane} cwd mismatch: expected {entry['cwd']}, found {actual_cwd}"
+                        )
+                    elif not agent.get("tab_id") or not agent.get("workspace_id"):
+                        last_state = "Pi session appeared but Herdr runtime identity remained incomplete"
+                    elif str(agent.get("tab_id")) != expected_tab or str(agent.get("workspace_id")) != expected_workspace:
+                        raise DeskError(f"restored Pi pane {expected_pane} reports mismatched Herdr runtime IDs")
+                    else:
+                        status_value = str(agent.get("agent_status") or "unknown")
+                        if status_value in USABLE_STATUSES:
+                            return
+                        if status_value in TERMINAL_BAD_STATUSES:
+                            raise DeskError(f"restored Pi pane {expected_pane} has unusable status {status_value}")
+                        last_state = f"Pi status remained {status_value}"
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DeskError(f"timed out waiting for restored pane {expected_pane}: {last_state}")
+        time.sleep(min(interval, remaining))
+
+
+def _restore_desk(args: argparse.Namespace) -> dict[str, Any]:
+    _path, manifest = load_manifest(args.name)
+    lease_cache: dict[Path, dict[Path, str]] = {}
+    managed_states: dict[str, tuple[Path, dict[str, Any]]] = {}
+    for entry in manifest["tabs"]:
+        if entry["role"] == "managed_worker":
+            managed_states[entry["session"]] = validate_managed(entry, lease_cache)
+
+    snap = snapshot()
+    live_by_session: dict[str, dict[str, Any]] = {}
+    for agent in snap["agents"]:
+        session = agent.get("agent_session")
+        if agent.get("agent") != "pi" or not isinstance(session, dict) or session.get("source") != "herdr:pi":
+            continue
+        value = session.get("value")
+        if not isinstance(value, str):
+            continue
+        if value in live_by_session:
+            raise DeskError(f"Pi session is already live more than once in Herdr: {value}")
+        live_by_session[value] = agent
+
+    runtimes: dict[str, dict[str, str | None]] = {}
+    live_workspace_ids: set[str] = set()
+    snapshot_tabs = {str(tab.get("tab_id")): tab for tab in snap["tabs"]}
+    for entry in manifest["tabs"]:
+        if agent := live_by_session.get(entry["session"]):
+            live_cwd = agent.get("cwd")
+            if not isinstance(live_cwd, str) or Path(live_cwd).resolve() != Path(entry["cwd"]).resolve():
+                raise DeskError(
+                    f"live Pi session cwd mismatch for {entry['label']}: expected {entry['cwd']}, found {live_cwd}"
+                )
+            runtime = {key: agent.get(key) for key in ("workspace_id", "tab_id", "pane_id", "terminal_id")}
+            if not all(runtime.get(key) for key in ("workspace_id", "tab_id", "pane_id")):
+                raise DeskError(f"live Pi session has incomplete Herdr identity: {entry['session']}")
+            live_tab = snapshot_tabs.get(str(runtime["tab_id"]))
+            if not live_tab or live_tab.get("pane_count") != 1:
+                raise DeskError(f"live Pi session is not in a dedicated one-pane tab: {entry['session']}")
+            status_value = str(agent.get("agent_status") or "unknown")
+            if status_value not in USABLE_STATUSES:
+                raise DeskError(f"live Pi session has unusable status {status_value}: {entry['session']}")
+            runtimes[entry["session"]] = runtime
+            live_workspace_ids.add(str(runtime["workspace_id"]))
+    if len(live_workspace_ids) > 1:
+        raise DeskError("recorded desk sessions are already live in multiple Herdr workspaces")
+
+    missing = [entry for entry in manifest["tabs"] if entry["session"] not in runtimes]
+    created_sessions: set[str] = set()
+    failures: list[dict[str, str]] = []
+    workspace_id = next(iter(live_workspace_ids), None)
+
+    if missing and workspace_id is None:
+        first = missing[0]
+        command = [
+            "herdr", "workspace", "create", "--cwd", first["cwd"],
+            "--label", manifest["workspace"]["label"], *env_args(first), "--no-focus",
+        ]
+        runtime = tab_runtime(run(command).stdout, "workspace create")
+        workspace_id = str(runtime["workspace_id"])
+        run(["herdr", "tab", "rename", str(runtime["tab_id"]), first["label"]])
+        runtimes[first["session"]] = runtime
+        created_sessions.add(first["session"])
+        missing = missing[1:]
+
+    if missing and workspace_id is None:
+        raise DeskError("could not determine a Herdr workspace for restore")
+    for entry in missing:
+        command = [
+            "herdr", "tab", "create", "--workspace", str(workspace_id),
+            "--cwd", entry["cwd"], "--label", entry["label"], *env_args(entry), "--no-focus",
+        ]
+        try:
+            runtime = tab_runtime(run(command).stdout, "tab create")
+            runtimes[entry["session"]] = runtime
+            created_sessions.add(entry["session"])
+        except DeskError as exc:
+            failures.append({"label": entry["label"], "error": str(exc)})
+
+    launch_order = sorted(
+        (entry for entry in manifest["tabs"] if entry["session"] in created_sessions),
+        key=lambda entry: entry["role"] == "orchestrator",
+    )
+    for entry in launch_order:
+        runtime = runtimes[entry["session"]]
+        command = f"exec {shlex.join(['pi', '--session', entry['session']])}"
+        launched = run(["herdr", "pane", "run", str(runtime["pane_id"]), command], check=False)
+        if launched.returncode != 0:
+            failures.append({
+                "label": entry["label"],
+                "error": launched.stderr.strip() or launched.stdout.strip() or "Pi startup failed",
+            })
+            run(["herdr", "tab", "close", str(runtime["tab_id"])], check=False)
+            runtimes.pop(entry["session"], None)
+            continue
+        try:
+            wait_for_restored_pi(entry, runtime)
+        except DeskError as exc:
+            failures.append({"label": entry["label"], "error": str(exc)})
+            run(["herdr", "tab", "close", str(runtime["tab_id"])], check=False)
+            runtimes.pop(entry["session"], None)
+            continue
+        if entry["role"] == "managed_worker":
+            registry, state = managed_states[entry["session"]]
+            update_registry(registry, state, runtime)
+
+    # Already-live managed sessions may carry pre-restart IDs in the registry.
+    for entry in manifest["tabs"]:
+        if entry["role"] != "managed_worker" or entry["session"] not in runtimes:
+            continue
+        if entry["session"] in created_sessions:
+            continue
+        registry, state = managed_states[entry["session"]]
+        update_registry(registry, state, runtimes[entry["session"]])
+
+    orchestrator = next(entry for entry in manifest["tabs"] if entry["role"] == "orchestrator")
+    orchestrator_runtime = runtimes.get(orchestrator["session"])
+    if orchestrator_runtime:
+        run(["herdr", "tab", "focus", str(orchestrator_runtime["tab_id"])], check=False)
+
+    restored = len(runtimes)
+    result: dict[str, Any] = {
+        "name": slugify(args.name),
+        "workspace_id": workspace_id,
+        "tabs_available": restored,
+        "tabs_total": len(manifest["tabs"]),
+        "message": "Desk restore completed; the manifest and durable leases were retained.",
+    }
+    if failures:
+        result["failures"] = failures
+        result["message"] = "Desk restore was partial. Valid sessions remain live; fix reported failures and retry safely."
+        result["_exit_code"] = 1
+    return result
+
+
+def save_desk(args: argparse.Namespace) -> dict[str, Any]:
+    with locked(), worker_locked():
+        return _save_desk(args)
+
+
+def restore_desk(args: argparse.Namespace) -> dict[str, Any]:
+    with locked(), worker_locked():
+        return _restore_desk(args)
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description=__doc__)
+    sub = root.add_subparsers(dest="command", required=True)
+    save = sub.add_parser("save", help="capture an idle Pi desk without closing or returning anything")
+    save.add_argument("name")
+    save.add_argument(
+        "--include-tab", action="append", default=[], metavar="TAB_ID",
+        help="deliberately include an otherwise unmanaged Pi tab (repeatable)",
+    )
+    save.set_defaults(handler=save_desk)
+    restore = sub.add_parser("restore", help="recreate saved Pi tabs against exact session files")
+    restore.add_argument("name")
+    restore.set_defaults(handler=restore_desk)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        result = args.handler(args)
+        exit_code = int(result.pop("_exit_code", 0))
+        print(json.dumps(result, indent=2), file=sys.stderr if exit_code else sys.stdout)
+        return exit_code
+    except DeskError as exc:
+        print(json.dumps({"error": str(exc)}), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print(json.dumps({"error": "interrupted"}), file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

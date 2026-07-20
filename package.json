@@ -1,0 +1,44 @@
+{
+  "name": "minimalist-pi-orchestrator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimalist Linux orchestration for visible Pi sessions in Herdr tabs and isolated Treehouse worktrees",
+  "license": "MIT",
+  "author": "Lasse Abelsen",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/86label/minimalist-pi-orchestrator.git"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "herdr",
+    "treehouse",
+    "worktree",
+    "orchestration"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/pi-workers.ts"
+    ]
+  },
+  "scripts": {
+    "check": "npm run typecheck && npm run format:check",
+    "typecheck": "tsc --noEmit",
+    "format:check": "prettier --check src package.json tsconfig.json"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.80.10",
+    "typebox": ">=1.1.38"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.10",
+    "prettier": "3.9.5",
+    "typebox": "1.3.6",
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""Create, inspect, and return visible Pi workers backed by Treehouse worktrees."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
+XDG_STATE = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser()
+CONFIG = Path(os.environ.get("PI_WORKER_CONFIG", str(XDG_CONFIG / "pi-worker/repos.json"))).expanduser()
+STATE_DIR = Path(
+    os.environ.get("PI_WORKER_STATE_DIR", str(XDG_STATE / "minimalist-pi-orchestrator"))
+).expanduser()
+WORKERS_DIR = STATE_DIR / "workers"
+LOCK_FILE = STATE_DIR / "state.lock"
+MINIMUM_VERSIONS = {"git": (2, 31, 0), "treehouse": (2, 0, 0), "herdr": (0, 7, 4), "pi": (0, 80, 10)}
+
+
+class WorkerError(RuntimeError):
+    """A safe, user-facing launcher failure."""
+
+
+def run(argv: list[str], *, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(argv, cwd=cwd, text=True, capture_output=True)
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise WorkerError(f"{' '.join(argv[:3])}: {detail}")
+    return result
+
+
+def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return run(["git", "-C", str(repo), *args], check=check)
+
+
+def slugify(value: str) -> str:
+    value = re.sub(r"[^a-z0-9._-]+", "-", value.strip().lower())
+    return value.strip("-._")
+
+
+def require_version(executable: str, minimum: tuple[int, int, int]) -> None:
+    result = run([executable, "--version"])
+    match = re.search(r"(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)", result.stdout + result.stderr)
+    wanted = ".".join(map(str, minimum))
+    if not match:
+        raise WorkerError(f"could not determine {executable} version; version {wanted} or newer is required")
+    actual = tuple(map(int, match.groups()))
+    if actual < minimum:
+        found = ".".join(map(str, actual))
+        raise WorkerError(f"{executable} {found} is unsupported; version {wanted} or newer is required")
+
+
+def load_config() -> dict[str, Any]:
+    try:
+        data = json.loads(CONFIG.read_text())
+    except FileNotFoundError as exc:
+        raise WorkerError(f"repository config not found: {CONFIG}") from exc
+    except json.JSONDecodeError as exc:
+        raise WorkerError(f"invalid repository config {CONFIG}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise WorkerError(f"{CONFIG} must contain a JSON object")
+    unknown = set(data) - {"default_repository", "repositories"}
+    if unknown:
+        raise WorkerError(f"{CONFIG} contains unknown keys: {', '.join(sorted(unknown))}")
+    repos = data.get("repositories")
+    if not isinstance(repos, dict) or not repos:
+        raise WorkerError(f"{CONFIG} must define a non-empty 'repositories' object")
+    if not isinstance(data.get("default_repository"), str):
+        raise WorkerError(f"{CONFIG} must define a string 'default_repository'")
+    for name, entry in repos.items():
+        if not isinstance(name, str) or not name or not isinstance(entry, dict):
+            raise WorkerError(f"{CONFIG} has an invalid repository entry")
+        unknown_entry = set(entry) - {"path", "remote", "default_branch"}
+        if unknown_entry:
+            raise WorkerError(
+                f"repository '{name}' contains unknown keys: {', '.join(sorted(unknown_entry))}"
+            )
+        for key in ("path", "remote", "default_branch"):
+            if not isinstance(entry.get(key), str) or not entry[key].strip():
+                raise WorkerError(f"repository '{name}' must define a non-empty string '{key}'")
+    return data
+
+
+def resolve_repo(name: str) -> tuple[str, Path, str, str]:
+    data = load_config()
+    repos = data["repositories"]
+    key = name or data.get("default_repository", "")
+    entry = repos.get(key)
+    if not isinstance(entry, dict):
+        raise WorkerError(f"unknown repository '{key}'; configured: {', '.join(sorted(repos))}")
+    path = Path(str(entry.get("path", ""))).expanduser().resolve()
+    if not path.is_dir():
+        raise WorkerError(f"configured repository does not exist: {path}")
+    if git(path, "rev-parse", "--is-inside-work-tree", check=False).stdout.strip() != "true":
+        raise WorkerError(f"configured path is not a Git repository: {path}")
+    return key, path, str(entry.get("remote", "origin")), str(entry.get("default_branch", "main"))
+
+
+def state_path(name: str) -> Path:
+    return WORKERS_DIR / f"{name}.json"
+
+
+def atomic_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def locked():
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(STATE_DIR, 0o700)
+    handle = LOCK_FILE.open("a+")
+    os.chmod(LOCK_FILE, 0o600)
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    return handle
+
+
+def recursive_value(value: Any, key: str) -> str | None:
+    if isinstance(value, dict):
+        found = value.get(key)
+        if isinstance(found, str):
+            return found
+        if isinstance(found, (int, float)):
+            return str(found)
+        for child in value.values():
+            if result := recursive_value(child, key):
+                return result
+    elif isinstance(value, list):
+        for child in value:
+            if result := recursive_value(child, key):
+                return result
+    return None
+
+
+def current_workspace() -> str:
+    if value := os.environ.get("HERDR_WORKSPACE_ID"):
+        return value
+    snapshot = run(["herdr", "api", "snapshot"])
+    try:
+        data = json.loads(snapshot.stdout)
+    except json.JSONDecodeError as exc:
+        raise WorkerError(f"could not parse Herdr snapshot: {exc}") from exc
+    value = recursive_value(data, "focused_workspace_id")
+    if not value:
+        raise WorkerError("no focused Herdr workspace; start pi-worker from inside Herdr")
+    return value
+
+
+def unique_branch(repo: Path, base: str) -> str:
+    candidate = f"work/{base}"
+    number = 2
+    while git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{candidate}", check=False).returncode == 0:
+        candidate = f"work/{base}-{number}"
+        number += 1
+    return candidate
+
+
+def validate_worktree(path: Path, expected_head: str) -> None:
+    if not path.is_absolute() or not path.is_dir():
+        raise WorkerError(f"Treehouse returned an invalid path: {path}")
+    top = Path(git(path, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
+    git_dir = Path(git(path, "rev-parse", "--absolute-git-dir").stdout.strip()).resolve()
+    common_dir = Path(git(path, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()).resolve()
+    actual_head = git(path, "rev-parse", "--verify", "HEAD").stdout.strip()
+    if top != path.resolve():
+        raise WorkerError(f"Treehouse path is not a repository root: {path}")
+    if git_dir == common_dir:
+        raise WorkerError(f"refusing to use the primary checkout: {path}")
+    if actual_head != expected_head:
+        raise WorkerError(f"worktree HEAD {actual_head} does not match fresh base {expected_head}")
+
+
+def cleanup_failed_start(repo: Path, worktree: Path | None, branch: str | None, tab_id: str | None) -> None:
+    if tab_id:
+        run(["herdr", "tab", "close", tab_id], check=False)
+    if worktree:
+        run(["treehouse", "return", str(worktree), "--force"], check=False)
+    if branch:
+        git(repo, "branch", "-D", branch, check=False)
+
+
+def start_worker(args: argparse.Namespace) -> dict[str, Any]:
+    name = slugify(args.name)
+    if not name:
+        raise WorkerError("worker name must contain a letter or number")
+    label = args.label.strip() if args.label else args.name.strip()
+    label = label or name
+    repository, repo, remote, default_branch = resolve_repo(args.repo)
+    workspace = args.workspace or current_workspace()
+    registry = state_path(name)
+
+    with locked():
+        if registry.exists():
+            existing = json.loads(registry.read_text())
+            raise WorkerError(f"worker '{name}' already exists at {existing.get('worktree', 'unknown path')}")
+
+        remote_ref = f"refs/remotes/{remote}/{default_branch}"
+        for executable, minimum in MINIMUM_VERSIONS.items():
+            require_version(executable, minimum)
+        fetch = git(repo, "fetch", "--quiet", remote, default_branch, check=False)
+        if fetch.returncode != 0:
+            raise WorkerError(f"unable to fetch {remote}/{default_branch}: {fetch.stderr.strip()}")
+        expected_head = git(repo, "rev-parse", "--verify", f"{remote_ref}^{{commit}}").stdout.strip()
+        git(repo, "symbolic-ref", f"refs/remotes/{remote}/HEAD", remote_ref)
+
+        worktree: Path | None = None
+        branch: str | None = None
+        tab_id: str | None = None
+        try:
+            acquired = run(["treehouse", "get", "--lease", "--lease-holder", name], cwd=repo)
+            worktree = Path(acquired.stdout.strip()).resolve()
+            validate_worktree(worktree, expected_head)
+            branch = unique_branch(repo, name)
+            git(worktree, "switch", "-c", branch, expected_head)
+
+            command = ["pi", "--name", label, "--approve"]
+            if args.model:
+                command.extend(["--model", args.model])
+            if args.prompt:
+                command.append(args.prompt)
+
+            # `herdr agent start --workspace` creates a sibling pane in the active
+            # tab. A dedicated tab prevents workers accumulating beside the caller.
+            tab_command = [
+                "herdr", "tab", "create", "--workspace", workspace,
+                "--cwd", str(worktree), "--label", label,
+                "--env", f"TREEHOUSE_LEASE_HOLDER={name}",
+                "--env", f"PI_WORKER_NAME={name}",
+                "--env", f"PI_WORKER_REPOSITORY={repository}",
+                "--focus" if args.focus else "--no-focus",
+            ]
+            created = run(tab_command)
+            try:
+                response = json.loads(created.stdout)
+            except json.JSONDecodeError as exc:
+                raise WorkerError(f"could not parse Herdr tab response: {created.stdout.strip()}") from exc
+            tab_id = recursive_value(response, "tab_id")
+            terminal_id = recursive_value(response, "terminal_id")
+            pane_id = recursive_value(response, "pane_id")
+            if not tab_id or not pane_id:
+                raise WorkerError(f"Herdr did not return tab and pane ids: {created.stdout.strip()}")
+
+            launched = run(["herdr", "pane", "run", pane_id, f"exec {shlex.join(command)}"])
+            state = {
+                "name": name, "label": label, "repository": repository,
+                "repo_root": str(repo), "worktree": str(worktree), "branch": branch,
+                "base": f"{remote}/{default_branch}", "workspace_id": workspace,
+                "tab_id": tab_id, "pane_id": pane_id, "terminal_id": terminal_id,
+                "prompted": bool(args.prompt), "model": args.model,
+            }
+            atomic_json(registry, state)
+            state["message"] = (
+                f"Started {'delegated' if args.prompt else 'empty'} Pi worker '{label}' "
+                f"on {branch} in {worktree}."
+            )
+            if warning := launched.stderr.strip():
+                state["warning"] = warning
+            return state
+        except BaseException:
+            cleanup_failed_start(repo, worktree, branch, tab_id)
+            raise
+
+
+def list_workers(_args: argparse.Namespace) -> dict[str, Any]:
+    workers: list[dict[str, Any]] = []
+    if WORKERS_DIR.exists():
+        for path in sorted(WORKERS_DIR.glob("*.json")):
+            try:
+                state = json.loads(path.read_text())
+                state["git_status"] = git(Path(state["worktree"]), "status", "--short", "--branch", check=False).stdout.strip()
+                workers.append(state)
+            except Exception as exc:
+                workers.append({"name": path.stem, "error": str(exc)})
+    return {"workers": workers}
+
+
+def return_worker(args: argparse.Namespace) -> dict[str, Any]:
+    name = slugify(args.name)
+    registry = state_path(name)
+    with locked():
+        if not registry.exists():
+            raise WorkerError(f"no recorded worker named '{name}'")
+        state = json.loads(registry.read_text())
+        worktree = Path(state["worktree"])
+        dirty = git(worktree, "status", "--porcelain", check=False).stdout.strip()
+        if dirty and not args.force:
+            raise WorkerError(f"worker '{name}' has uncommitted changes; preserve them or pass --force")
+
+        tab_id = state.get("tab_id")
+        pane_id = state.get("pane_id")
+        current_tab = os.environ.get("HERDR_TAB_ID")
+        current_pane = os.environ.get("HERDR_PANE_ID")
+        if pane_id and pane_id == current_pane:
+            raise WorkerError(f"refusing to close worker '{name}' from inside its own pane")
+        if tab_id:
+            tab_result = run(["herdr", "tab", "get", tab_id], check=False)
+            pane_count = 0
+            if tab_result.returncode == 0:
+                try:
+                    raw_count = recursive_value(json.loads(tab_result.stdout), "pane_count")
+                    pane_count = int(raw_count) if raw_count else 0
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            # Legacy launchers could share the orchestrator tab. Never close a
+            # caller/shared tab; close only the recorded worker pane.
+            if tab_id == current_tab or pane_count > 1:
+                if not pane_id:
+                    raise WorkerError(f"worker '{name}' shares a tab but has no recorded pane id")
+                run(["herdr", "pane", "close", pane_id], check=False)
+            else:
+                run(["herdr", "tab", "close", tab_id], check=False)
+        command = ["treehouse", "return", str(worktree)]
+        if args.force:
+            command.append("--force")
+        returned = run(command, check=False)
+        if returned.returncode != 0:
+            raise WorkerError(returned.stderr.strip() or returned.stdout.strip() or "Treehouse return failed")
+        registry.unlink()
+        return {
+            "name": name, "branch": state.get("branch"), "worktree": str(worktree),
+            "message": f"Returned worker '{state.get('label', name)}'; branch {state.get('branch')} remains available.",
+        }
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description=__doc__)
+    sub = root.add_subparsers(dest="command", required=True)
+    start = sub.add_parser("start", help="lease a worktree and start Pi in a Herdr tab")
+    start.add_argument("--repo", default="", help="configured repository name (default from config)")
+    start.add_argument("--name", required=True, help="unique machine-friendly worker name")
+    start.add_argument("--label", help="human-readable Herdr tab and Pi session name")
+    start.add_argument("--prompt", help="initial Pi prompt; omit for a human-led empty session")
+    start.add_argument("--model", help="optional Pi model selector")
+    start.add_argument("--workspace", help="Herdr workspace id (defaults to caller's workspace)")
+    focus = start.add_mutually_exclusive_group()
+    focus.add_argument("--focus", action="store_true", help="focus the new tab")
+    focus.add_argument("--no-focus", dest="focus", action="store_false", help="remain in current tab")
+    start.set_defaults(focus=False, handler=start_worker)
+    status = sub.add_parser("status", help="list recorded workers")
+    status.set_defaults(handler=list_workers)
+    returned = sub.add_parser("return", help="close a worker and return its Treehouse lease")
+    returned.add_argument("name")
+    returned.add_argument("--force", action="store_true", help="discard uncommitted work")
+    returned.set_defaults(handler=return_worker)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        print(json.dumps(args.handler(args), indent=2))
+        return 0
+    except WorkerError as exc:
+        print(json.dumps({"error": str(exc)}), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print(json.dumps({"error": "interrupted"}), file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
