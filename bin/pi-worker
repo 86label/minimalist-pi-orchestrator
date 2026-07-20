@@ -97,12 +97,21 @@ def resolve_repo(name: str) -> tuple[str, Path, str, str]:
     entry = repos.get(key)
     if not isinstance(entry, dict):
         raise WorkerError(f"unknown repository '{key}'; configured: {', '.join(sorted(repos))}")
-    path = Path(str(entry.get("path", ""))).expanduser().resolve()
+    path = Path(entry["path"]).expanduser().resolve()
     if not path.is_dir():
         raise WorkerError(f"configured repository does not exist: {path}")
     if git(path, "rev-parse", "--is-inside-work-tree", check=False).stdout.strip() != "true":
         raise WorkerError(f"configured path is not a Git repository: {path}")
-    return key, path, str(entry.get("remote", "origin")), str(entry.get("default_branch", "main"))
+    remote = entry["remote"]
+    default_branch = entry["default_branch"]
+    if remote.startswith("-") or re.fullmatch(r"[A-Za-z0-9._/-]+", remote) is None:
+        raise WorkerError(f"repository '{key}' has an invalid remote name")
+    if git(path, "remote", "get-url", remote, check=False).returncode != 0:
+        raise WorkerError(f"repository '{key}' has no configured remote named '{remote}'")
+    branch_check = git(path, "check-ref-format", "--branch", default_branch, check=False)
+    if branch_check.returncode != 0:
+        raise WorkerError(f"repository '{key}' has an invalid default branch name")
+    return key, path, remote, default_branch
 
 
 def state_path(name: str) -> Path:
@@ -178,7 +187,7 @@ def unique_branch(repo: Path, base: str) -> str:
     return candidate
 
 
-def validate_worktree(path: Path, expected_head: str) -> None:
+def validate_worktree(path: Path) -> str:
     if not path.is_absolute() or not path.is_dir():
         raise WorkerError(f"Treehouse returned an invalid path: {path}")
     top = Path(git(path, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
@@ -189,8 +198,7 @@ def validate_worktree(path: Path, expected_head: str) -> None:
         raise WorkerError(f"Treehouse path is not a repository root: {path}")
     if git_dir == common_dir:
         raise WorkerError(f"refusing to use the primary checkout: {path}")
-    if actual_head != expected_head:
-        raise WorkerError(f"worktree HEAD {actual_head} does not match fresh base {expected_head}")
+    return actual_head
 
 
 def cleanup_failed_start(repo: Path, worktree: Path | None, branch: str | None, tab_id: str | None) -> None:
@@ -227,12 +235,18 @@ def start_worker(args: argparse.Namespace) -> dict[str, Any]:
         git(repo, "symbolic-ref", f"refs/remotes/{remote}/HEAD", remote_ref)
 
         worktree: Path | None = None
+        rollback_worktree: Path | None = None
         branch: str | None = None
         tab_id: str | None = None
         try:
             acquired = run(["treehouse", "get", "--lease", "--lease-holder", name], cwd=repo)
             worktree = Path(acquired.stdout.strip()).resolve()
-            validate_worktree(worktree, expected_head)
+            actual_head = validate_worktree(worktree)
+            # Only a confirmed linked worktree is safe for automatic destructive
+            # rollback. Never pass an invalid or primary path to return --force.
+            rollback_worktree = worktree
+            if actual_head != expected_head:
+                raise WorkerError(f"worktree HEAD {actual_head} does not match fresh base {expected_head}")
             branch = unique_branch(repo, name)
             git(worktree, "switch", "-c", branch, expected_head)
 
@@ -280,7 +294,7 @@ def start_worker(args: argparse.Namespace) -> dict[str, Any]:
                 state["warning"] = warning
             return state
         except BaseException:
-            cleanup_failed_start(repo, worktree, branch, tab_id)
+            cleanup_failed_start(repo, rollback_worktree, branch, tab_id)
             raise
 
 

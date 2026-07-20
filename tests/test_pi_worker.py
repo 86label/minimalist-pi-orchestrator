@@ -203,6 +203,7 @@ class PiWorkerTests(unittest.TestCase):
         result = self.worker("start", "--name", "unsafe", env=env)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("refusing to use the primary checkout", result.stderr)
+        self.assertFalse(any(c[:2] == ["treehouse", "return"] for c in self.commands()))
         self.assertTrue(self.repo.exists())
         self.assertFalse((self.state / "workers/unsafe.json").exists())
 
