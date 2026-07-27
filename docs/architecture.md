@@ -1,35 +1,39 @@
 # Architecture
 
-Minimalist Pi Orchestrator has three components:
+Minimalist Pi Orchestrator has three deliberately small components:
 
-- `pi-worker` owns repository validation, Treehouse lease acquisition, Git branch creation, Herdr tab startup, lifecycle records, and guarded return.
-- `pi-desk` conservatively saves and restores exact Pi sessions that already have durable working directories and leases.
-- `src/pi-workers.ts` only translates typed Pi tool calls into `pi-worker` argument vectors and returns its JSON output.
+- `bin/pi-worker` owns deterministic repository validation, Treehouse leases, Git branches, Herdr tabs, exact-worker controls, lifecycle records, rollback, and guarded return.
+- `bin/pi-desk` conservatively saves and restores exact Pi sessions that already have durable working directories and leases.
+- `src/pi-workers.ts` is a thin typed adapter from Pi tools to `pi-worker` arguments and JSON results.
 
-## Worker startup
+## Sources of truth
 
-`pi-worker start` resolves a repository through the explicit allowlist, verifies minimum dependency versions, fetches the configured remote branch, acquires a durable Treehouse lease, and validates that the returned linked worktree is exactly at the fetched commit. It then creates a unique `work/<name>` branch and a dedicated one-pane Herdr tab before starting Pi.
+Git owns branches and commits, Treehouse owns worktree pools and leases, Herdr owns workspaces/tabs/panes and live Pi telemetry, and Pi owns conversations and session files. The orchestrator stores only the small identity records connecting those systems.
 
-Lifecycle mutation is serialized with a filesystem lock. State writes are atomic and owner-only. If startup fails, rollback closes only the tab created by that attempt, force-returns only its new lease, and removes only its unneeded startup branch.
+A workspace `AGENTS.md` can route the orchestrator to a human-owned `ORCHESTRATION.md`. Operating policy belongs there rather than in launcher mechanics or tool descriptions.
+
+Managed worker processes inherit `PI_WORKER_NAME`. The extension registers no orchestration tools in those processes, and `pi-worker start` refuses nested starts. This prevents accidental nesting but is not a security boundary; a human can create sibling workers from the orchestrator.
+
+## Worker lifecycle
+
+Startup resolves only an allowlisted repository, verifies minimum dependency versions, fetches the configured remote/default branch, obtains a Treehouse lease, and validates that the result is an absolute linked-worktree root exactly at the fetched commit. It then creates a unique branch, unique Pi session ID, owner-only session directory, and dedicated Herdr tab before starting Pi with deterministic session storage.
+
+Lifecycle mutation is serialized with an owner-only filesystem lock. Records are written atomically with owner-only permissions. Startup rollback closes only the tab created by that attempt, force-returns only a confirmed linked worktree, and removes only its unneeded startup branch.
+
+Status and inspection join registry identity with bounded Herdr/Pi, Git, Treehouse lease, and GitHub pull-request evidence. Exact follow-up, focus, and resume operations revalidate recorded runtime identity immediately before mutation and stop on missing or ambiguous identity. Follow-up submits Enter once and never retries it. Resume never allocates replacement resources.
+
+Managed-worker restore is registry-driven and needs no desk manifest. It preflights exact session files, linked worktrees, branches, and leases before recreating missing tabs, then requires an exact Pi session/cwd/runtime handshake before updating transient Herdr IDs. It never allocates a replacement worktree.
+
+Return refuses dirty work by default and reports conservative Git/PR diagnostics. Destructive return is available only after explicit interactive human confirmation through the Pi extension. The named Git branch and private Pi transcript survive return; the active registry record and Treehouse lease do not.
 
 ## Desk recovery
 
-`pi-desk save` joins Herdr's Pi session snapshot to worker records and Treehouse lease status. It writes only the identities needed to validate a later restore.
-
-`pi-desk restore` validates all durable identities before creating UI. After submitting each exact `pi --session` command, it waits for Herdr to report the expected pane, session path, working directory, runtime identity, and a usable Pi status. Only a complete handshake updates transient Herdr IDs in a worker record.
+Save joins Herdr's exact Pi session snapshot to worker records and Treehouse lease status. Restore validates every durable identity before creating UI, then waits for the expected pane/session/cwd/status handshake before updating transient runtime IDs.
 
 Recovery never owns source work or leases. It does not commit, clean, reset, switch, repair, allocate, or return a worktree.
 
-## State ownership
-
-- Git owns commits and branches.
-- Treehouse owns worktree pools and durable leases.
-- Herdr owns workspaces, tabs, panes, and terminal processes.
-- Pi owns coding conversations and session files.
-- Minimalist Pi Orchestrator stores only the small identity records connecting those systems.
-
-State defaults to `${XDG_STATE_HOME:-~/.local/state}/minimalist-pi-orchestrator/` with owner-only permissions.
+State defaults to `${XDG_STATE_HOME:-~/.local/state}/minimalist-pi-orchestrator/`. Worker records and desk manifests contain identity metadata. The owner-only `sessions/` subtree contains full Pi transcripts and is deliberately retained after normal return.
 
 ## Intentional non-features
 
-The integration does not inspect a task catalog, claim work, dispatch automatically, assign roles, implement stages, retry tasks, enforce budgets, or maintain workflow state. A human directs every session.
+The integration creates visible sessions selected by a human. It does not inspect a catalog and dispatch work, assign roles, implement workflow stages, retry tasks, enforce budgets, or maintain a workflow database.
