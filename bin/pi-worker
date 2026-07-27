@@ -9,9 +9,12 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +25,7 @@ STATE_DIR = Path(
     os.environ.get("PI_WORKER_STATE_DIR", str(XDG_STATE / "minimalist-pi-orchestrator"))
 ).expanduser()
 WORKERS_DIR = STATE_DIR / "workers"
+SESSIONS_DIR = STATE_DIR / "sessions"
 LOCK_FILE = STATE_DIR / "state.lock"
 MINIMUM_VERSIONS = {"git": (2, 31, 0), "treehouse": (2, 0, 0), "herdr": (0, 7, 4), "pi": (0, 80, 10)}
 
@@ -238,6 +242,7 @@ def start_worker(args: argparse.Namespace) -> dict[str, Any]:
         rollback_worktree: Path | None = None
         branch: str | None = None
         tab_id: str | None = None
+        session_dir: Path | None = None
         try:
             acquired = run(["treehouse", "get", "--lease", "--lease-holder", name], cwd=repo)
             worktree = Path(acquired.stdout.strip()).resolve()
@@ -250,7 +255,15 @@ def start_worker(args: argparse.Namespace) -> dict[str, Any]:
             branch = unique_branch(repo, name)
             git(worktree, "switch", "-c", branch, expected_head)
 
-            command = ["pi", "--name", label, "--approve"]
+            instance_id = str(uuid.uuid4())
+            session_dir = SESSIONS_DIR / instance_id
+            session_dir.mkdir(parents=True, mode=0o700)
+            os.chmod(SESSIONS_DIR, 0o700)
+            os.chmod(session_dir, 0o700)
+            command = [
+                "pi", "--name", label, "--approve",
+                "--session-dir", str(session_dir), "--session-id", instance_id,
+            ]
             if args.model:
                 command.extend(["--model", args.model])
             if args.prompt:
@@ -281,7 +294,8 @@ def start_worker(args: argparse.Namespace) -> dict[str, Any]:
             state = {
                 "name": name, "label": label, "repository": repository,
                 "repo_root": str(repo), "worktree": str(worktree), "branch": branch,
-                "base": f"{remote}/{default_branch}", "workspace_id": workspace,
+                "remote": remote, "base": f"{remote}/{default_branch}", "workspace_id": workspace,
+                "instance_id": instance_id, "session_dir": str(session_dir),
                 "tab_id": tab_id, "pane_id": pane_id, "terminal_id": terminal_id,
                 "prompted": bool(args.prompt), "model": args.model,
             }
@@ -295,20 +309,585 @@ def start_worker(args: argparse.Namespace) -> dict[str, Any]:
             return state
         except BaseException:
             cleanup_failed_start(repo, rollback_worktree, branch, tab_id)
+            if session_dir is not None:
+                try:
+                    session_dir.rmdir()  # Remove only an empty failed-start directory.
+                except OSError:
+                    pass
             raise
+
+
+def snapshot() -> dict[str, Any]:
+    result = run(["herdr", "api", "snapshot"], check=False)
+    if result.returncode != 0:
+        raise WorkerError(result.stderr.strip() or "Herdr snapshot unavailable")
+    try:
+        raw = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise WorkerError(f"could not parse Herdr snapshot: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise WorkerError("Herdr snapshot must be a JSON object")
+    # Herdr versions wrap snapshots differently; only unwrap the documented shape.
+    result = raw.get("result")
+    data = result.get("snapshot", raw) if isinstance(result, dict) else raw
+    if not isinstance(data, dict):
+        raise WorkerError("Herdr snapshot payload must be a JSON object")
+    return data
+
+
+def session_path(agent: dict[str, Any]) -> str | None:
+    value = agent.get("agent_session", {})
+    if agent.get("agent") != "pi" or not isinstance(value, dict):
+        return None
+    if value.get("agent") != "pi" or value.get("source") != "herdr:pi" or value.get("kind") != "path":
+        return None
+    candidate = value.get("value")
+    if not isinstance(candidate, str) or not candidate:
+        return None
+    path = Path(candidate)
+    if not path.is_absolute() or not path.is_file():
+        return None
+    return str(path.resolve())
+
+
+def bounded_pane_output(pane_id: str) -> tuple[str | None, str | None]:
+    result = run(["herdr", "pane", "read", pane_id, "--source", "recent-unwrapped", "--lines", "80", "--format", "text"], check=False)
+    if result.returncode != 0:
+        return None, result.stderr.strip() or "pane output unavailable"
+    lines = result.stdout.splitlines()[-80:]
+    text = "\n".join(lines)
+    return text[-8000:], None
+
+
+def git_evidence(state: dict[str, Any]) -> dict[str, Any]:
+    worktree = Path(str(state["worktree"]))
+    evidence: dict[str, Any] = {"status": "unavailable"}
+    status = git(worktree, "status", "--short", "--branch", check=False)
+    if status.returncode != 0:
+        evidence["error"] = status.stderr.strip() or "worktree unavailable"
+        return evidence
+    evidence["status"] = status.stdout.strip()
+    evidence["dirty"] = bool(git(worktree, "status", "--porcelain", check=False).stdout.strip())
+    base = str(state.get("base", ""))
+    branch = str(state.get("branch", ""))
+    if base and branch:
+        commits = git(worktree, "rev-list", "--count", f"{base}..{branch}", check=False)
+        if commits.returncode == 0:
+            evidence["commits_since_base"] = int(commits.stdout.strip() or "0")
+        merged = git(worktree, "merge-base", "--is-ancestor", branch, base, check=False)
+        evidence["merged_into_base"] = merged.returncode == 0
+    upstream = git(worktree, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False)
+    if upstream.returncode == 0:
+        evidence["upstream"] = upstream.stdout.strip()
+        counts = git(worktree, "rev-list", "--left-right", "--count", "@{upstream}...HEAD", check=False)
+        if counts.returncode == 0:
+            behind, ahead = counts.stdout.split()
+            evidence["ahead"] = int(ahead)
+            evidence["behind"] = int(behind)
+    return evidence
+
+
+def remote_repository(worktree: Path, remote_name: str) -> str | None:
+    remote = git(worktree, "remote", "get-url", remote_name, check=False)
+    if remote.returncode != 0:
+        return None
+    value = remote.stdout.strip().removesuffix(".git")
+    match = re.search(r"(?:github\.com[/:])([^/]+/[^/]+)$", value)
+    return match.group(1) if match else None
+
+
+def pr_evidence(worktree: Path, branch: str, remote_name: str = "origin") -> dict[str, Any]:
+    # A head name alone is not branch identity: forks can use the same name.
+    if shutil.which("gh") is None:
+        return {"status": "unavailable"}
+    expected_repo = remote_repository(worktree, remote_name)
+    head = git(worktree, "rev-parse", "--verify", "HEAD", check=False)
+    if not expected_repo or head.returncode != 0:
+        return {"status": "ambiguous"}
+    result = run(["gh", "pr", "list", "--head", branch, "--state", "all", "--json", "number,url,state,isDraft,mergedAt,headRepository,headRefName,headRefOid", "--limit", "5"], cwd=worktree, check=False)
+    if result.returncode != 0:
+        return {"status": "unavailable"}
+    try:
+        candidates = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {"status": "ambiguous"}
+    if not isinstance(candidates, list):
+        return {"status": "ambiguous"}
+    matches = [item for item in candidates if isinstance(item, dict) and item.get("headRefName") == branch and item.get("headRefOid") == head.stdout.strip() and isinstance(item.get("headRepository"), dict) and item["headRepository"].get("nameWithOwner") == expected_repo]
+    if len(matches) != 1 and candidates:
+        return {"status": "ambiguous", "candidate_count": len(candidates)}
+    return {"status": "known", "pull_requests": matches}
+
+
+def lease_evidence(
+    worktree: Path, holder: str, repo_root: Path | None = None
+) -> dict[str, Any]:
+    result = run(["treehouse", "status"], cwd=repo_root, check=False)
+    if result.returncode != 0:
+        return {"status": "unavailable"}
+    # Treehouse has no stable JSON contract here. Parse its current text format
+    # conservatively and require exact durable path and holder values.
+    pattern = re.compile(r"^\S+\s+leased\s+(.+?)\s+\(held by (.+)\)\s*$")
+    for line in result.stdout.splitlines():
+        match = pattern.match(line)
+        if not match:
+            continue
+        try:
+            candidate = Path(match.group(1)).expanduser().resolve()
+        except (OSError, RuntimeError):
+            continue
+        if candidate == worktree.resolve():
+            actual_holder = match.group(2).strip()
+            return {
+                "status": "valid" if actual_holder == holder else "ambiguous",
+                "detail": line[:500],
+            }
+    return {"status": "missing"}
+
+
+def inspect_state(
+    state: dict[str, Any], *, include_output: bool = True, include_evidence: bool = True
+) -> dict[str, Any]:
+    worktree = Path(str(state["worktree"]))
+    report: dict[str, Any] = {"name": state.get("name"), "label": state.get("label"), "worktree": state.get("worktree"), "branch": state.get("branch"), "identity": {key: state.get(key) for key in ("repository", "worktree", "branch", "workspace_id", "tab_id", "pane_id", "session_path") if state.get(key) is not None}}
+    if include_evidence:
+        report["git"] = git_evidence(state)
+        report["pull_requests"] = pr_evidence(
+            worktree, str(state.get("branch", "")), str(state.get("remote", "origin"))
+        )
+        repo_root = Path(str(state["repo_root"])) if state.get("repo_root") else None
+        report["lease"] = lease_evidence(
+            worktree, str(state.get("name", "")), repo_root
+        )
+    try:
+        data = snapshot()
+    except WorkerError as exc:
+        report["classification"] = "ambiguous"
+        report["herdr"] = {"status": "unavailable", "error": str(exc)}
+        return report
+    pane_id = state.get("pane_id")
+    raw_agents = data.get("agents", [])
+    raw_tabs = data.get("tabs", [])
+    if not isinstance(raw_agents, list) or not isinstance(raw_tabs, list):
+        report["classification"] = "ambiguous"
+        report["herdr"] = {"status": "ambiguous", "reason": "invalid runtime identity collections"}
+        return report
+    agents = [
+        item
+        for item in raw_agents
+        if isinstance(item, dict) and item.get("pane_id") == pane_id
+    ]
+    tabs = [
+        item
+        for item in raw_tabs
+        if isinstance(item, dict) and item.get("tab_id") == state.get("tab_id")
+    ]
+    if len(agents) > 1 or len(tabs) > 1:
+        report["classification"] = "ambiguous"
+        report["herdr"] = {"status": "ambiguous", "reason": "multiple exact runtime identities"}
+        return report
+    if not agents or not tabs:
+        report["classification"] = "exited/missing"
+        report["herdr"] = {"status": "missing", "tab_present": bool(tabs), "pane_present": bool(agents)}
+        return report
+    agent, tab = agents[0], tabs[0]
+    expected = {"workspace_id": state.get("workspace_id"), "tab_id": state.get("tab_id"), "pane_id": state.get("pane_id")}
+    actual = {key: agent.get(key) for key in expected}
+    if any(actual[key] != value for key, value in expected.items()) or tab.get("workspace_id") != state.get("workspace_id") or agent.get("agent") != "pi" or (state.get("terminal_id") and agent.get("terminal_id") != state.get("terminal_id")) or not session_path(agent):
+        report["classification"] = "ambiguous"
+        report["herdr"] = {"status": "ambiguous", "reason": "incomplete or mismatched Pi runtime identity"}
+        return report
+    agent_cwd = agent.get("cwd")
+    if (
+        not isinstance(agent_cwd, str)
+        or not Path(agent_cwd).is_absolute()
+        or Path(agent_cwd).resolve() != worktree.resolve()
+    ):
+        report["classification"] = "ambiguous"
+        report["herdr"] = {"status": "ambiguous", "reason": "recorded pane cwd differs from recorded worktree"}
+        return report
+    native = str(agent.get("agent_status", "unknown")).lower()
+    categories = {"working": "working", "blocked": "blocked", "idle": "idle", "done": "idle", "completed": "idle", "exited": "exited/missing"}
+    report["classification"] = categories.get(native, "ambiguous")
+    report["herdr"] = {"status": native, "tab_present": True, "pane_present": True, "session_path": session_path(agent)}
+    if include_output:
+        output, error = bounded_pane_output(str(pane_id))
+        if output is not None:
+            report["recent_output"] = output
+        if error:
+            report["pane_output"] = {"status": "unavailable", "error": error}
+    return report
+
+
+def inspect_worker(args: argparse.Namespace) -> dict[str, Any]:
+    name = slugify(args.name)
+    registry = state_path(name)
+    if not registry.exists():
+        raise WorkerError(f"no recorded worker named '{name}'")
+    with locked():
+        state = json.loads(registry.read_text())
+        report = inspect_state(state)
+        durable_session = report.get("herdr", {}).get("session_path")
+        # This is reconciliation of an existing registry record, not task state.
+        if isinstance(durable_session, str) and state.get("session_path") != durable_session:
+            state["session_path"] = durable_session
+            atomic_json(registry, state)
+        return report
 
 
 def list_workers(_args: argparse.Namespace) -> dict[str, Any]:
     workers: list[dict[str, Any]] = []
-    if WORKERS_DIR.exists():
-        for path in sorted(WORKERS_DIR.glob("*.json")):
-            try:
-                state = json.loads(path.read_text())
-                state["git_status"] = git(Path(state["worktree"]), "status", "--short", "--branch", check=False).stdout.strip()
-                workers.append(state)
-            except Exception as exc:
-                workers.append({"name": path.stem, "error": str(exc)})
+    with locked():
+        if WORKERS_DIR.exists():
+            for path in sorted(WORKERS_DIR.glob("*.json")):
+                try:
+                    state = json.loads(path.read_text())
+                    report = inspect_state(state, include_output=False)
+                    durable_session = report.get("herdr", {}).get("session_path")
+                    if isinstance(durable_session, str) and state.get("session_path") != durable_session:
+                        state["session_path"] = durable_session
+                        atomic_json(path, state)
+                    workers.append(report)
+                except Exception as exc:
+                    workers.append({"name": path.stem, "classification": "ambiguous", "error": str(exc)})
     return {"workers": workers}
+
+
+def require_exact_live_worker(name: str) -> dict[str, Any]:
+    registry = state_path(name)
+    if not registry.exists():
+        raise WorkerError(f"no recorded worker named '{name}'")
+    state = json.loads(registry.read_text())
+    report = inspect_state(state, include_output=False, include_evidence=False)
+    if report.get("classification") in ("exited/missing", "ambiguous"):
+        raise WorkerError(f"worker '{name}' is {report.get('classification')}; refusing to target an uncertain pane")
+    return state
+
+
+def follow_up_worker(args: argparse.Namespace) -> dict[str, Any]:
+    name = slugify(args.name)
+    text = args.text.strip()
+    if not text or len(text) > 2000:
+        raise WorkerError("follow-up text must be 1..2000 characters")
+    with locked():
+        state = require_exact_live_worker(name)
+        pane = str(state["pane_id"])
+        # Type once and send one Enter. Never retry Enter: a retry can duplicate a prompt.
+        typed = run(["herdr", "pane", "send-text", pane, text], check=False)
+        if typed.returncode != 0:
+            raise WorkerError(typed.stderr.strip() or "Herdr could not type follow-up")
+        submitted = run(["herdr", "pane", "send-keys", pane, "enter"], check=False)
+        if submitted.returncode != 0:
+            raise WorkerError(submitted.stderr.strip() or "follow-up was typed but Enter was not accepted; it was not retried")
+        output, output_error = bounded_pane_output(pane)
+        return {"name": name, "typed": True, "submitted": True, "verification": "inconclusive", "recent_output": output, "warning": output_error or "Enter was accepted by Herdr; pane output cannot prove Pi consumed the follow-up."}
+
+
+def focus_worker(args: argparse.Namespace) -> dict[str, Any]:
+    name = slugify(args.name)
+    with locked():
+        state = require_exact_live_worker(name)
+        result = run(["herdr", "tab", "focus", str(state["tab_id"])], check=False)
+        if result.returncode != 0:
+            raise WorkerError(result.stderr.strip() or "Herdr could not focus worker tab")
+        return {"name": name, "message": f"Focused worker '{state.get('label', name)}'."}
+
+
+def pane_matches_resume_identity(state: dict[str, Any]) -> bool:
+    result = run(["herdr", "pane", "get", str(state["pane_id"])], check=False)
+    if result.returncode != 0:
+        return False
+    try:
+        pane = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False
+    expected = {"workspace_id": state.get("workspace_id"), "tab_id": state.get("tab_id"), "pane_id": state.get("pane_id")}
+    if any(pane.get(key) != value for key, value in expected.items()):
+        return False
+    if state.get("terminal_id") and pane.get("terminal_id") != state.get("terminal_id"):
+        return False
+    pane_cwd = pane.get("cwd")
+    return (
+        isinstance(pane_cwd, str)
+        and Path(pane_cwd).is_absolute()
+        and Path(pane_cwd).resolve() == Path(str(state["worktree"])).resolve()
+    )
+
+
+def resume_worker(args: argparse.Namespace) -> dict[str, Any]:
+    name = slugify(args.name)
+    with locked():
+        registry = state_path(name)
+        if not registry.exists():
+            raise WorkerError(f"no recorded worker named '{name}'")
+        state = json.loads(registry.read_text())
+        session = state.get("session_path")
+        if (
+            not isinstance(session, str)
+            or not Path(session).is_absolute()
+            or not Path(session).is_file()
+        ):
+            raise WorkerError(f"worker '{name}' has no exact durable Pi session identity; use pi-desk restore/reconciliation instead")
+        report = inspect_state(state, include_output=False, include_evidence=False)
+        if report.get("classification") != "exited/missing" or not report.get("herdr", {}).get("tab_present"):
+            raise WorkerError(f"worker '{name}' is not an exact missing Pi session in its recorded tab; refusing resume")
+        worktree = Path(str(state["worktree"]))
+        if not worktree.is_dir() or git(worktree, "rev-parse", "--show-toplevel", check=False).returncode != 0:
+            raise WorkerError(f"worker '{name}' worktree is unavailable; no replacement will be allocated")
+        if not pane_matches_resume_identity(state):
+            raise WorkerError(f"worker '{name}' recorded pane identity/cwd is unavailable or mismatched; refusing exact resume")
+        result = run(
+            [
+                "herdr", "pane", "run", str(state["pane_id"]),
+                f"exec {shlex.join(['pi', '--approve', '--session', session])}",
+            ],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise WorkerError(result.stderr.strip() or "Herdr could not submit exact Pi resume")
+        return {"name": name, "session_path": session, "message": "Submitted exact Pi session resume; inspect worker status to confirm Herdr identity."}
+
+
+def exact_session_file(state: dict[str, Any]) -> str | None:
+    recorded = state.get("session_path")
+    if isinstance(recorded, str):
+        path = Path(recorded)
+        if path.is_absolute() and path.is_file():
+            return str(path.resolve())
+    instance_id = state.get("instance_id")
+    session_dir_value = state.get("session_dir")
+    if not isinstance(instance_id, str) or not isinstance(session_dir_value, str):
+        return None
+    try:
+        if str(uuid.UUID(instance_id)) != instance_id:
+            return None
+    except ValueError:
+        return None
+    session_dir = Path(session_dir_value)
+    if not session_dir.is_absolute() or not session_dir.is_dir():
+        return None
+    matches = [
+        path.resolve()
+        for path in session_dir.glob(f"*_{instance_id}.jsonl")
+        if path.is_file()
+    ]
+    return str(matches[0]) if len(matches) == 1 else None
+
+
+def validate_worker_restore(state: dict[str, Any]) -> tuple[Path, str]:
+    name = state.get("name")
+    if not isinstance(name, str) or not name:
+        raise WorkerError("worker registry has no exact worker name")
+    worktree_value = state.get("worktree")
+    if not isinstance(worktree_value, str) or not Path(worktree_value).is_absolute():
+        raise WorkerError(f"worker '{name}' has no absolute worktree identity")
+    worktree = Path(worktree_value).resolve()
+    validate_worktree(worktree)
+    branch = git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    if branch.returncode != 0 or branch.stdout.strip() != state.get("branch"):
+        raise WorkerError(
+            f"worker '{name}' branch mismatch: expected {state.get('branch')}, "
+            f"found {branch.stdout.strip() or 'detached HEAD'}"
+        )
+    repo_root_value = state.get("repo_root")
+    repo_root = Path(str(repo_root_value)).resolve() if repo_root_value else None
+    lease = lease_evidence(worktree, name, repo_root)
+    if lease.get("status") != "valid":
+        raise WorkerError(f"worker '{name}' lease identity is {lease.get('status')}; refusing restore")
+    session = exact_session_file(state)
+    if session is None:
+        raise WorkerError(f"worker '{name}' has no unique exact durable Pi session file")
+    return worktree, session
+
+
+def restore_timing() -> tuple[float, float]:
+    try:
+        timeout = float(os.environ.get("PI_WORKER_RESTORE_TIMEOUT_SECONDS", "15"))
+        interval = float(os.environ.get("PI_WORKER_RESTORE_POLL_SECONDS", "0.25"))
+    except ValueError as exc:
+        raise WorkerError("worker restore timeout and poll interval must be numbers") from exc
+    if timeout <= 0 or interval <= 0:
+        raise WorkerError("worker restore timeout and poll interval must be positive")
+    return timeout, interval
+
+
+def wait_for_worker_pi(
+    state: dict[str, Any], session: str, runtime: dict[str, str | None]
+) -> None:
+    timeout, interval = restore_timing()
+    deadline = time.monotonic() + timeout
+    last_state = "Pi did not appear"
+    while True:
+        data = snapshot()
+        agents = data.get("agents", [])
+        if not isinstance(agents, list):
+            raise WorkerError("Herdr snapshot has no valid agents collection")
+        pane_agents = [
+            agent
+            for agent in agents
+            if isinstance(agent, dict) and agent.get("pane_id") == runtime["pane_id"]
+        ]
+        if len(pane_agents) > 1:
+            raise WorkerError(f"restored pane {runtime['pane_id']} reports multiple agents")
+        if pane_agents:
+            agent = pane_agents[0]
+            actual_session = session_path(agent)
+            if actual_session is None:
+                last_state = "Pi appeared without a complete durable session identity"
+            elif actual_session != session:
+                raise WorkerError(
+                    f"restored worker '{state['name']}' session mismatch: "
+                    f"expected {session}, found {actual_session}"
+                )
+            else:
+                cwd = agent.get("cwd")
+                if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+                    last_state = "Pi appeared without an absolute cwd"
+                elif Path(cwd).resolve() != Path(str(state["worktree"])).resolve():
+                    raise WorkerError(f"restored worker '{state['name']}' cwd mismatch")
+                elif any(agent.get(key) != runtime[key] for key in ("workspace_id", "tab_id", "pane_id")):
+                    raise WorkerError(f"restored worker '{state['name']}' runtime identity mismatch")
+                elif state.get("terminal_id") and runtime.get("terminal_id") and agent.get("terminal_id") != runtime["terminal_id"]:
+                    raise WorkerError(f"restored worker '{state['name']}' terminal identity mismatch")
+                else:
+                    status = str(agent.get("agent_status", "unknown")).lower()
+                    if status in ("idle", "done", "completed", "working", "blocked"):
+                        return
+                    if status in ("error", "failed"):
+                        raise WorkerError(f"restored worker '{state['name']}' has unusable status {status}")
+                    last_state = f"Pi status remained {status}"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise WorkerError(
+                f"timed out waiting for restored worker '{state['name']}': {last_state}"
+            )
+        time.sleep(min(interval, remaining))
+
+
+def restore_workers(args: argparse.Namespace) -> dict[str, Any]:
+    workspace = args.workspace or current_workspace()
+    restored: list[str] = []
+    already_live: list[str] = []
+    failures: list[dict[str, str]] = []
+    with locked():
+        records: list[tuple[Path, dict[str, Any], Path, str, dict[str, Any]]] = []
+        for registry in sorted(WORKERS_DIR.glob("*.json")) if WORKERS_DIR.exists() else []:
+            try:
+                state = json.loads(registry.read_text())
+                worktree, session = validate_worker_restore(state)
+                report = inspect_state(state, include_output=False, include_evidence=False)
+                if report.get("classification") == "ambiguous":
+                    raise WorkerError(f"worker '{state.get('name')}' has ambiguous Herdr identity")
+                records.append((registry, state, worktree, session, report))
+            except (json.JSONDecodeError, KeyError, WorkerError) as exc:
+                raise WorkerError(f"worker restore preflight failed for {registry.name}: {exc}") from exc
+
+        for registry, state, worktree, session, report in records:
+            name = str(state["name"])
+            try:
+                worktree, session = validate_worker_restore(state)
+                report = inspect_state(state, include_output=False, include_evidence=False)
+            except WorkerError as exc:
+                failures.append({"name": name, "error": f"identity changed after preflight: {exc}"})
+                continue
+            if report.get("classification") == "ambiguous":
+                failures.append({"name": name, "error": "Herdr identity became ambiguous after preflight"})
+                continue
+            if report.get("classification") != "exited/missing":
+                state["session_path"] = session
+                atomic_json(registry, state)
+                already_live.append(name)
+                continue
+
+            created_tab = False
+            runtime: dict[str, str | None]
+            if report.get("herdr", {}).get("tab_present"):
+                if not pane_matches_resume_identity(state):
+                    failures.append({"name": name, "error": "recorded pane identity is unavailable or mismatched"})
+                    continue
+                runtime = {key: state.get(key) for key in ("workspace_id", "tab_id", "pane_id", "terminal_id")}
+            else:
+                command = [
+                    "herdr", "tab", "create", "--workspace", workspace,
+                    "--cwd", str(worktree), "--label", str(state.get("label", name)),
+                    "--env", f"TREEHOUSE_LEASE_HOLDER={name}",
+                    "--env", f"PI_WORKER_NAME={name}",
+                    "--env", f"PI_WORKER_REPOSITORY={state.get('repository', '')}",
+                    "--no-focus",
+                ]
+                created = run(command, check=False)
+                if created.returncode != 0:
+                    failures.append({"name": name, "error": created.stderr.strip() or "Herdr tab creation failed"})
+                    continue
+                try:
+                    response = json.loads(created.stdout)
+                except json.JSONDecodeError:
+                    failures.append({"name": name, "error": "invalid Herdr tab response"})
+                    continue
+                runtime = {
+                    "workspace_id": workspace,
+                    "tab_id": recursive_value(response, "tab_id"),
+                    "pane_id": recursive_value(response, "pane_id"),
+                    "terminal_id": recursive_value(response, "terminal_id"),
+                }
+                if not runtime["tab_id"] or not runtime["pane_id"]:
+                    failures.append({"name": name, "error": "Herdr returned incomplete tab identity"})
+                    continue
+                created_tab = True
+
+            launch = run(
+                [
+                    "herdr", "pane", "run", str(runtime["pane_id"]),
+                    f"exec {shlex.join(['pi', '--approve', '--session', session])}",
+                ],
+                check=False,
+            )
+            if launch.returncode != 0:
+                failures.append({"name": name, "error": launch.stderr.strip() or "Pi resume submission failed"})
+                if created_tab:
+                    run(["herdr", "tab", "close", str(runtime["tab_id"])], check=False)
+                continue
+            try:
+                wait_for_worker_pi(state, session, runtime)
+            except WorkerError as exc:
+                failures.append({"name": name, "error": str(exc)})
+                if created_tab:
+                    run(["herdr", "tab", "close", str(runtime["tab_id"])], check=False)
+                continue
+            state.update(runtime)
+            state["session_path"] = session
+            atomic_json(registry, state)
+            restored.append(name)
+
+    result: dict[str, Any] = {
+        "workspace_id": workspace,
+        "restored": restored,
+        "already_live": already_live,
+        "message": "Managed worker restore completed; durable worktrees and sessions were retained.",
+    }
+    if failures:
+        result["failures"] = failures
+        result["message"] = "Managed worker restore was partial; fix reported runtime failures and retry."
+        result["_exit_code"] = 1
+    return result
+
+
+def return_disposition(evidence: dict[str, Any], pr: dict[str, Any]) -> str:
+    if evidence.get("dirty"):
+        return "dirty"
+    if evidence.get("merged_into_base"):
+        return "merged"
+    if pr.get("status") == "ambiguous":
+        return "ambiguous"
+    if pr.get("status") == "known":
+        pulls = pr.get("pull_requests", [])
+        if any(isinstance(item, dict) and item.get("state") == "OPEN" for item in pulls):
+            return "open-pr"
+    if evidence.get("upstream") and not evidence.get("ahead", 0):
+        return "pushed"
+    if evidence.get("commits_since_base") and not evidence.get("upstream"):
+        return "local-only-unpublished"
+    return "ambiguous"
 
 
 def return_worker(args: argparse.Namespace) -> dict[str, Any]:
@@ -319,9 +898,17 @@ def return_worker(args: argparse.Namespace) -> dict[str, Any]:
             raise WorkerError(f"no recorded worker named '{name}'")
         state = json.loads(registry.read_text())
         worktree = Path(state["worktree"])
-        dirty = git(worktree, "status", "--porcelain", check=False).stdout.strip()
+        evidence = git_evidence(state)
+        dirty = bool(evidence.get("dirty"))
+        pr = pr_evidence(
+            worktree, str(state.get("branch", "")), str(state.get("remote", "origin"))
+        )
+        diagnostics = {"disposition": return_disposition(evidence, pr), "git": evidence, "pull_requests": pr}
         if dirty and not args.force:
-            raise WorkerError(f"worker '{name}' has uncommitted changes; preserve them or pass --force")
+            raise WorkerError(
+                f"worker '{name}' has uncommitted changes; preserve them or pass --force. "
+                f"Return diagnostics: {json.dumps(diagnostics, sort_keys=True)}"
+            )
 
         tab_id = state.get("tab_id")
         pane_id = state.get("pane_id")
@@ -353,8 +940,21 @@ def return_worker(args: argparse.Namespace) -> dict[str, Any]:
         if returned.returncode != 0:
             raise WorkerError(returned.stderr.strip() or returned.stdout.strip() or "Treehouse return failed")
         registry.unlink()
+        warnings: list[str] = []
+        commits = evidence.get("commits_since_base")
+        if commits and not evidence.get("merged_into_base"):
+            if not evidence.get("upstream"):
+                warnings.append(f"{commits} local-only commit(s) relative to {state.get('base')}; the branch remains available but may be unpublished.")
+            elif evidence.get("ahead", 0):
+                warnings.append(f"{evidence['ahead']} commit(s) are ahead of the recorded upstream; branch remains available.")
+        if evidence.get("merged_into_base"):
+            warnings.append("Recorded branch is already reachable from the recorded base.")
+        if pr.get("status") == "unavailable":
+            warnings.append("Pull-request state could not be established reliably.")
         return {
             "name": name, "branch": state.get("branch"), "worktree": str(worktree),
+            "session_retained": exact_session_file(state),
+            "diagnostics": diagnostics, "warnings": warnings,
             "message": f"Returned worker '{state.get('label', name)}'; branch {state.get('branch')} remains available.",
         }
 
@@ -373,8 +973,24 @@ def parser() -> argparse.ArgumentParser:
     focus.add_argument("--focus", action="store_true", help="focus the new tab")
     focus.add_argument("--no-focus", dest="focus", action="store_false", help="remain in current tab")
     start.set_defaults(focus=False, handler=start_worker)
-    status = sub.add_parser("status", help="list recorded workers")
+    status = sub.add_parser("status", help="list recorded workers with conservative live inspection")
     status.set_defaults(handler=list_workers)
+    inspect = sub.add_parser("inspect", help="inspect one exact recorded worker")
+    inspect.add_argument("name")
+    inspect.set_defaults(handler=inspect_worker)
+    follow = sub.add_parser("follow-up", help="type one short follow-up and submit it once")
+    follow.add_argument("name")
+    follow.add_argument("text")
+    follow.set_defaults(handler=follow_up_worker)
+    focus_worker_parser = sub.add_parser("focus", help="focus one exact recorded worker tab")
+    focus_worker_parser.add_argument("name")
+    focus_worker_parser.set_defaults(handler=focus_worker)
+    resume = sub.add_parser("resume", help="resume an exited Pi using an exact recorded session path")
+    resume.add_argument("name")
+    resume.set_defaults(handler=resume_worker)
+    restore = sub.add_parser("restore-all", help="recreate all missing managed workers from durable records")
+    restore.add_argument("--workspace", help="Herdr workspace id (defaults to caller's workspace)")
+    restore.set_defaults(handler=restore_workers)
     returned = sub.add_parser("return", help="close a worker and return its Treehouse lease")
     returned.add_argument("name")
     returned.add_argument("--force", action="store_true", help="discard uncommitted work")
@@ -385,8 +1001,14 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
-        print(json.dumps(args.handler(args), indent=2))
-        return 0
+        if args.command == "start" and os.environ.get("PI_WORKER_NAME"):
+            raise WorkerError(
+                "managed Pi workers cannot start nested workers; ask the orchestrator to create a sibling worker"
+            )
+        result = args.handler(args)
+        exit_code = int(result.pop("_exit_code", 0))
+        print(json.dumps(result, indent=2), file=sys.stderr if exit_code else sys.stdout)
+        return exit_code
     except WorkerError as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 1

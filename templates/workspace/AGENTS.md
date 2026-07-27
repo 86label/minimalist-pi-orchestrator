@@ -1,7 +1,5 @@
 # Orchestration workspace
 
-This directory is a human-directed development desk, not an application repository or automated task queue.
+This directory is a human-directed coordination workspace, not an application repository or automated task queue. Read `ORCHESTRATION.md` completely at the start of every orchestrator session; it is the canonical operating model.
 
-At the start of an orchestrator session, read `ORCHESTRATION.md` and call `list_pi_workers`. Use the Pi worker tools rather than ad hoc Treehouse, Git, or Herdr setup. Preserve dirty worker worktrees and never force-return one unless the human explicitly asks to discard its uncommitted work.
-
-The human decides what to discuss, start, review, merge, stop, or abandon. Do not add autonomous task claiming, queues, roles, stages, retries, budgets, or workflow state.
+Use the typed Pi worker tools rather than ad hoc Treehouse, Git, or Herdr setup. The human directs what to discuss, create, review, merge, stop, or abandon. Workers follow the target repository's own instructions.
